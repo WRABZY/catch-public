@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package metrics;
+option go_package = "/metrics";
+
+service CatchMetrics {
+   rpc GetNumberOfActiveUsers(GetRequest) returns (MetricsReply) {}
+   rpc GetGameBooferSize(GetRequest) returns (MetricsReply) {}
+   rpc GetGameBooferGamesAvailable(GetRequest) returns (MetricsReply) {}
+}
+
+message GetRequest {}
+message MetricsReply {
+    string metricName = 1;
+    int64 metricValue = 2;
+}

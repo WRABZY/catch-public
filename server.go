@@ -8,12 +8,17 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	pm "catch/metrics_main/metrics"
+
+	"google.golang.org/grpc"
 )
 
 const (
@@ -185,6 +190,7 @@ type GameServer struct {
 	lastCleaningDaemonRun time.Time
 	leaderboardNames      [10]string
 	leaderboardScores     [10]uint64
+	pm.UnimplementedCatchMetricsServer
 }
 
 type User struct {
@@ -264,6 +270,18 @@ func (gs *GameServer) startCleaningDaemon() {
 	}()
 }
 
+func (gs *GameServer) startGRPCMetricsServerDaemon(port int) {
+	go func(p int) {
+		lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", p))
+		if err != nil {
+			log.Printf("gRPC metrics server daemon failed to listen: %v", err)
+		}
+		grpcServer := grpc.NewServer()
+		pm.RegisterCatchMetricsServer(grpcServer, gs)
+		grpcServer.Serve(lis)
+	}(port)
+}
+
 func main() {
 	localConfig, err := os.ReadFile("config.local")
 	if err != nil {
@@ -291,6 +309,7 @@ func main() {
 		gameBoofer: newGameBoofer(),
 	}
 	server.startCleaningDaemon()
+	server.startGRPCMetricsServerDaemon(9890)
 
 	http.Handle("/", server)
 	http.Handle("/"+sysEP+"/", newSysController(sysToken, server))
@@ -307,9 +326,6 @@ func (gs *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	go gs.handleRequest(body)
 	w.WriteHeader(http.StatusOK)
 }
-
-var startText = []byte(`,"text":"/start",`)
-var wakeUpText = []byte(`,"text":"/wakeup",`)
 
 func (gs *GameServer) handleRequest(body []byte) {
 	//log.Println("request:", string(body)) // TODO DELETE
