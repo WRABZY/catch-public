@@ -8,4 +8,4 @@
 
 Дашборд Grafana<br>
 <br>
-<img alt="grafana-dashboard" src="https://raw.githubusercontent.com/WRABZY/catch-public/refs/heads/main/example/grafana-dashboard.png" width="1000">
+<img alt="grafana-dashboard" src="https://raw.githubusercontent.com/WRABZY/catch-public/refs/heads/main/example/grafana-dashboard.png" width="1200">
