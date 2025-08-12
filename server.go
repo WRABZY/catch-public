@@ -328,8 +328,6 @@ func (gs *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gs *GameServer) handleRequest(body []byte) {
-	//log.Println("request:", string(body)) // TODO DELETE
-
 	userId, err := getUserId(body)
 	if err != nil {
 		return
