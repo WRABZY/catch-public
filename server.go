@@ -310,6 +310,8 @@ func main() {
 	}
 	server.startCleaningDaemon()
 	server.startGRPCMetricsServerDaemon(9890)
+	server.initDatabase()
+	server.leaderboardNames, server.leaderboardScores = server.loadLeaderboard()
 
 	http.Handle("/", server)
 	http.Handle("/"+sysEP+"/", newSysController(sysToken, server))
@@ -328,6 +330,8 @@ func (gs *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gs *GameServer) handleRequest(body []byte) {
+	//log.Println("request:", string(body)) // TODO DELETE
+
 	userId, err := getUserId(body)
 	if err != nil {
 		return
@@ -767,6 +771,7 @@ func (gs *GameServer) insertNewScore(user *User) {
 		}
 		gs.leaderboardScores[i] = newScore
 		gs.leaderboardNames[i] = user.name
+		gs.updateLeaderboard(true)
 	}
 }
 
