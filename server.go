@@ -22,15 +22,19 @@ import (
 )
 
 const (
-	methodSendMessage         = "/sendMessage"
-	methodDeleteMessage       = "/deleteMessage"
-	methodSendPhoto           = "/sendPhoto"
-	methodEditMessageMedia    = "/editMessageMedia"
-	methodAnswerCallbackQuery = "/answerCallbackQuery"
+	methodSendMessage            = "/sendMessage"
+	methodDeleteMessage          = "/deleteMessage"
+	methodSendPhoto              = "/sendPhoto"
+	methodEditMessageMedia       = "/editMessageMedia"
+	methodEditMessageReplyMarkup = "/editMessageReplyMarkup"
+	methodAnswerCallbackQuery    = "/answerCallbackQuery"
+	methodSendInvoice            = "/sendInvoice"
+	methodAnswerPreCheckoutQuery = "/answerPreCheckoutQuery"
 
 	typeJSON = "Content-Type: application/json"
 
-	inlineKeyBoardClose = `{"inline_keyboard":[[{"text":"❎","callback_data":"inline0inline"}]]}`
+	inlineKeyboardClose       = `{"inline_keyboard":[[{"text":"❎","callback_data":"inline0inline"}]]}`
+	inlineKeyboardPayTemplate = `{"inline_keyboard":[[{"text":"XTR %d","pay":"True"},{"text":"❎","callback_data":"inline0inline"}]]}`
 
 	inlineKeyboardWait = `{"inline_keyboard":[
 	   [{"text":"⏳","callback_data":"inline1inline"},
@@ -168,8 +172,9 @@ const (
 	callback7 = uint8('7')
 	callback8 = uint8('8')
 	callback9 = uint8('9')
+	callbackP = uint8('P')
 
-	answerCallbackIsBusyTemplate = `{"callback_query_id":"%d","text":"⏳\nYour request is still being processed, please try again later","show_alert":true}`
+	answerCallbackIsBusyTemplate = `{"callback_query_id":"%d","text":"⏳\nПожалуйста, дождитесь завершения обработки предыдущего запроса","show_alert":true}`
 	answerCallbackOkTemplate     = `{"callback_query_id":"%d"}`
 	answerCallbackAlertTemplate  = `{"callback_query_id":"%d","text":"%s","show_alert":true}`
 
@@ -183,17 +188,21 @@ const (
 )
 
 type GameServer struct {
+	databaseMutex         sync.Mutex
 	userCacheMutex        sync.RWMutex
 	userCache             map[int64]*User
 	apiUrl                string
 	gameBoofer            *GameBoofer
 	lastCleaningDaemonRun time.Time
+	leaderboardMutex      sync.RWMutex
 	leaderboardNames      [10]string
 	leaderboardScores     [10]uint64
 	pm.UnimplementedCatchMetricsServer
+	price int
 }
 
 type User struct {
+	id           int64
 	name         string
 	game         *game.Game
 	lastActivity time.Time
@@ -297,16 +306,22 @@ func main() {
 	lineSeparatorLen := len(lineSep)
 	lineIndex2 := lineIndex1 + lineSeparatorLen + bytes.Index(localConfig[lineIndex1+lineSeparatorLen:], []byte(lineSep))
 	lineIndex3 := lineIndex2 + lineSeparatorLen + bytes.Index(localConfig[lineIndex2+lineSeparatorLen:], []byte(lineSep))
+	lineIndex4 := lineIndex3 + lineSeparatorLen + bytes.Index(localConfig[lineIndex3+lineSeparatorLen:], []byte(lineSep))
 
 	addr := string(localConfig[len("addr="):lineIndex1])
 	path := string(localConfig[lineIndex1+lineSeparatorLen+len("path=") : lineIndex2])
 	sysEP := string(localConfig[lineIndex2+lineSeparatorLen+len("sys_endpoint=") : lineIndex3])
-	sysToken := string(localConfig[lineIndex3+lineSeparatorLen+len("sys_token="):])
+	sysToken := string(localConfig[lineIndex3+lineSeparatorLen+len("sys_token=") : lineIndex4])
+	price, err := strconv.Atoi(string(localConfig[lineIndex4+lineSeparatorLen+len("price="):]))
+	if err != nil {
+		price = 100 // default
+	}
 
 	server := &GameServer{
 		userCache:  make(map[int64]*User),
 		apiUrl:     addr + path,
 		gameBoofer: newGameBoofer(),
+		price:      price,
 	}
 	server.startCleaningDaemon()
 	server.startGRPCMetricsServerDaemon(9890)
@@ -330,7 +345,7 @@ func (gs *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gs *GameServer) handleRequest(body []byte) {
-	//log.Println("request:", string(body)) // TODO DELETE
+	log.Println("request:", string(body)) // TODO DELETE
 
 	userId, err := getUserId(body)
 	if err != nil {
@@ -341,6 +356,16 @@ func (gs *GameServer) handleRequest(body []byte) {
 	user, ok := gs.userCache[userId]
 	gs.userCacheMutex.RUnlock()
 	if !ok {
+		chId, err := getChatId(body)
+		if err != nil {
+			// Maybe payment
+			preCheckoutQueryId := getPreCheckoutQueryId(body)
+			if preCheckoutQueryId == "" {
+				return
+			}
+			gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Для совершения покупок необходимо начать игру.`)
+			return
+		}
 		if bytes.Contains(body, startText) { // == command "New game"
 			user = new(User)
 			user.token = make(chan struct{}, 1)
@@ -350,22 +375,12 @@ func (gs *GameServer) handleRequest(body []byte) {
 			gs.userCache[userId] = user
 			gs.userCacheMutex.Unlock()
 
-			user.chatId, err = getChatId(body)
-			if err != nil {
-				gs.userCacheMutex.Lock()
-				delete(gs.userCache, userId)
-				gs.userCacheMutex.Unlock()
-				return
-			}
-			incomingMessageId, err := getMessageId(body)
-			if err == nil {
-				gs.sendDeleteMessage(user.chatId, incomingMessageId)
-			}
+			user.id = userId
+			user.chatId = chId
+			user.messageId = -1
 			user.name = getName(body)
 			user.game = gs.gameBoofer.getGame()
-			user.messageId = -1
-
-			user.gotHair = true // TODO false
+			user.game.HasHair, user.gotHair = gs.loadUserUsingHair(userId)
 			user.lastActivity = time.Now()
 
 			user.game.RefreshFrame()
@@ -373,42 +388,68 @@ func (gs *GameServer) handleRequest(body []byte) {
 			<-user.token
 		} else if bytes.Contains(body, wakeUpText) {
 			// TODO DB
+			return
 		}
+		incomingMessageId, err := getMessageId(body)
+		if err != nil {
+			return
+		}
+		gs.sendDeleteMessage(chId, incomingMessageId)
 		return
 	}
 
-	tokenIsBusy := false
+	callbackId, err := getCallbackId(body)
 	select {
 	case user.token <- struct{}{}:
 	default:
-		tokenIsBusy = true
-	}
-
-	callbackId, err := getCallbackId(body)
-	if tokenIsBusy {
-		if err == nil {
-			gs.answerCallbackIsBusy(callbackId)
+		if err != nil {
+			// Maybe payment
+			preCheckoutQueryId := getPreCheckoutQueryId(body)
+			if preCheckoutQueryId == "" {
+				return
+			}
+			gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Пожалуйста, дождитесь завершения обработки предыдущего запроса`)
+			return
 		}
+		gs.answerCallbackIsBusy(callbackId)
 		return
 	}
 
 	if err != nil {
-		// This is not callback
-		if bytes.Contains(body, startText) {
-			thisMessageId, err := getMessageId(body)
-			if err == nil {
-				gs.sendDeleteMessage(user.chatId, thisMessageId)
+		// Maybe payment
+		preCheckoutQueryId := getPreCheckoutQueryId(body)
+		if preCheckoutQueryId == "" {
+			// This is not callback and not payment
+			if bytes.Contains(body, startText) {
+				thisMessageId, err := getMessageId(body)
+				if err == nil {
+					gs.sendDeleteMessage(user.chatId, thisMessageId)
+				}
+				if user.messageId != -1 {
+					if user.game.PlayerIsAlive() {
+						gs.sendDeleteMessage(user.chatId, user.messageId)
+					} else {
+						gs.sendDeleteReplyMarkup(user)
+					}
+				}
+				user.game.ResetGame()
+				user.game.RefreshFrame()
+				gs.sendNewGameMessage(user)
 			}
-			if user.messageId != -1 {
-				if user.game.PlayerIsAlive() {
-					gs.sendDeleteMessage(user.chatId, user.messageId)
+		} else {
+			if user.gotHair {
+				gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Покупка уже выполнена`)
+			} else {
+				if ok := gs.updatePaymentsDatabase(user.id, true); ok {
+					user.gotHair = true
+					user.game.HasHair = true
+					user.game.RefreshFrame()
+					gs.sendActualFrame(user, true)
+					gs.answerOkPreCheckoutQuery(preCheckoutQueryId)
 				} else {
-					// TODO delete keyboard
+					gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Покупка сейчас недоступна, пожалуйста, повторите попытку позднее`)
 				}
 			}
-			user.game.ResetGame()
-			user.game.RefreshFrame()
-			gs.sendNewGameMessage(user)
 		}
 	} else {
 		// This is callback
@@ -444,17 +485,21 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 		}
 		return
 	case callback1:
-		// TODO shop
 		if user.gotHair {
 			if user.watchingBack {
 				alertMessage = cantDoIt
 			} else {
 				gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
 				user.game.HasHair = !user.game.HasHair
+				gs.updatePaymentsDatabase(user.id, user.game.HasHair)
 				user.game.RefreshFrame()
 				gs.sendActualFrame(user, true)
 				return
 			}
+		} else {
+			gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
+			gs.sendShop(user)
+			return
 		}
 	case callback2:
 		if user.watchingBack || !user.game.MovePlayerTo(game.North) {
@@ -703,16 +748,17 @@ func (gs *GameServer) sendNewGameMessage(user *User) {
 }
 
 func (gs *GameServer) sendDeleteMessage(chatId, messageId int64) {
-	resp, _ := http.Post(fmt.Sprintf("%s%s?chat_id=%d&message_id=%d", gs.apiUrl, methodDeleteMessage, chatId, messageId), typeJSON, nil)
-	if resp != nil {
-		resp.Body.Close()
+	resp, err := http.Post(fmt.Sprintf("%s%s?chat_id=%d&message_id=%d", gs.apiUrl, methodDeleteMessage, chatId, messageId), typeJSON, nil)
+	if err != nil {
+		return
 	}
+	resp.Body.Close()
 }
 
 func (gs *GameServer) sendLeaderboard(user *User) {
 	var text string
 	var builder strings.Builder
-	gs.userCacheMutex.RLock()
+	gs.leaderboardMutex.RLock()
 	builder.WriteString(fmt.Sprintf(leaderboardMessageTemplate0, gs.leaderboardNames[0], gs.leaderboardScores[0]))
 	if gs.leaderboardScores[1] != 0 {
 		builder.WriteString(fmt.Sprintf(leaderboardMessageTemplate1, gs.leaderboardNames[1], gs.leaderboardScores[1]))
@@ -728,18 +774,19 @@ func (gs *GameServer) sendLeaderboard(user *User) {
 		}
 	}
 	text = builder.String()
-	gs.userCacheMutex.RUnlock()
+	gs.leaderboardMutex.RUnlock()
 
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
 		"text":"` + text + `",
-		"reply_markup":` + inlineKeyBoardClose + `
+		"reply_markup":` + inlineKeyboardClose + `
 	}`
 
-	resp, _ := http.Post(gs.apiUrl+methodSendMessage, typeJSON, strings.NewReader(dataToSend))
-	if resp != nil {
-		resp.Body.Close()
+	resp, err := http.Post(gs.apiUrl+methodSendMessage, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
 	}
+	resp.Body.Close()
 }
 
 func (gs *GameServer) sendHelp(user *User) {
@@ -750,18 +797,85 @@ func (gs *GameServer) sendHelp(user *User) {
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
 		"text":"` + text + `",
-		"reply_markup":` + inlineKeyBoardClose + `
+		"reply_markup":` + inlineKeyboardClose + `
 	}`
 
-	resp, _ := http.Post(gs.apiUrl+methodSendMessage, typeJSON, strings.NewReader(dataToSend))
-	if resp != nil {
-		resp.Body.Close()
+	resp, err := http.Post(gs.apiUrl+methodSendMessage, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
 	}
+	resp.Body.Close()
+}
+
+func (gs *GameServer) sendShop(user *User) {
+	var title = `Лавандовое каре`
+	var description = `Вы можете поддержать разработчика, купив для главной фигуры игры образ с этой милой шевелюрой`
+	var inlineKeyboardPay = fmt.Sprintf(inlineKeyboardPayTemplate, gs.price)
+	var prices = fmt.Sprintf(`[{"label":"stars","amount":%d}]`, gs.price)
+
+	dataToSend := `{
+		"chat_id":` + fmt.Sprint(user.chatId) + `,
+		"title":"` + title + `",
+		"description":"` + description + `",
+		"photo_url": "https://raw.githubusercontent.com/WRABZY/catch-public/refs/heads/main/promo/promo.png",
+		"photo_width":300,
+		"photo_height":300,
+		"payload":"inlinePinline",
+		"currency":"XTR",
+		"prices":` + prices + `,
+		"reply_markup":` + inlineKeyboardPay + `
+	}`
+
+	resp, err := http.Post(gs.apiUrl+methodSendInvoice, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func (gs *GameServer) sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, reason string) {
+	dataToSend := `{
+		"pre_checkout_query_id":"` + preCheckoutQueryId + `",
+		"ok":false,
+		"error_message":"` + reason + `"
+	}`
+
+	resp, err := http.Post(gs.apiUrl+methodAnswerPreCheckoutQuery, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func (gs *GameServer) answerOkPreCheckoutQuery(preCheckoutQueryId string) {
+	dataToSend := `{
+		"pre_checkout_query_id":"` + preCheckoutQueryId + `",
+		"ok":true
+	}`
+
+	resp, err := http.Post(gs.apiUrl+methodAnswerPreCheckoutQuery, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+}
+
+func (gs *GameServer) sendDeleteReplyMarkup(user *User) {
+	dataToSend := `{
+		"chat_id":` + fmt.Sprint(user.chatId) + `,
+		"message_id":` + fmt.Sprint(user.messageId) + `
+	}`
+
+	resp, err := http.Post(gs.apiUrl+methodEditMessageReplyMarkup, typeJSON, strings.NewReader(dataToSend))
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 func (gs *GameServer) insertNewScore(user *User) {
-	gs.userCacheMutex.Lock()
-	defer gs.userCacheMutex.Unlock()
+	gs.leaderboardMutex.Lock()
+	defer gs.leaderboardMutex.Unlock()
 	i := len(gs.leaderboardScores) - 1
 	newScore := user.game.GetScore()
 	if gs.leaderboardScores[i] < newScore {
@@ -771,7 +885,7 @@ func (gs *GameServer) insertNewScore(user *User) {
 		}
 		gs.leaderboardScores[i] = newScore
 		gs.leaderboardNames[i] = user.name
-		gs.updateLeaderboard(true)
+		gs.updateLeaderboardDatabase(true)
 	}
 }
 
