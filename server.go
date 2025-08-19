@@ -756,8 +756,8 @@ func (gs *GameServer) sendDeleteMessage(chatId, messageId int64) {
 }
 
 func (gs *GameServer) sendLeaderboard(user *User) {
-	var text string
 	var builder strings.Builder
+	builder.WriteString("Лучшие игроки в Catch!\n\n")
 	gs.leaderboardMutex.RLock()
 	builder.WriteString(fmt.Sprintf(leaderboardMessageTemplate0, gs.leaderboardNames[0], gs.leaderboardScores[0]))
 	if gs.leaderboardScores[1] != 0 {
@@ -773,12 +773,11 @@ func (gs *GameServer) sendLeaderboard(user *User) {
 			}
 		}
 	}
-	text = builder.String()
 	gs.leaderboardMutex.RUnlock()
 
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
-		"text":"` + text + `",
+		"text":"` + builder.String() + `",
 		"reply_markup":` + inlineKeyboardClose + `
 	}`
 
@@ -790,26 +789,30 @@ func (gs *GameServer) sendLeaderboard(user *User) {
 }
 
 func (gs *GameServer) sendHelp(user *User) {
-	// TODO
-	var text = `ОБ ИГРЕ
-Правила: https://telegra.ph/TestHelp-08-08`
+	var text = `*Об игре*
+Правила игры: [telegra\\.ph/Catch](https://telegra.ph/Catch-Pravila-igry-08-18)
+Автор: [WRABZY](https://t.me/WRABZY)`
 
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
 		"text":"` + text + `",
-		"reply_markup":` + inlineKeyboardClose + `
+		"parse_mode":"MarkdownV2",
+		"reply_markup":` + inlineKeyboardClose + `,
+		"link_preview_options": {"url": "https://telegra.ph/Catch-Pravila-igry-08-18"}
 	}`
 
 	resp, err := http.Post(gs.apiUrl+methodSendMessage, typeJSON, strings.NewReader(dataToSend))
 	if err != nil {
 		return
 	}
+	bbb, _ := io.ReadAll(resp.Body)
+	log.Println(string(bbb))
 	resp.Body.Close()
 }
 
 func (gs *GameServer) sendShop(user *User) {
 	var title = `Лавандовое каре`
-	var description = `Вы можете поддержать разработчика, купив для главной фигуры игры образ с этой милой шевелюрой`
+	var description = `Вы можете поддержать разработчика, купив для главной фигуры игры альтернативный образ`
 	var inlineKeyboardPay = fmt.Sprintf(inlineKeyboardPayTemplate, gs.price)
 	var prices = fmt.Sprintf(`[{"label":"stars","amount":%d}]`, gs.price)
 
