@@ -1,0 +1,2 @@
+host=<grafana_addr>/otlp/v1/metrics
+token=<grafana_token>

@@ -174,23 +174,16 @@ const (
 	callback9 = uint8('9')
 	callbackP = uint8('P')
 
-	answerCallbackIsBusyTemplate = `{"callback_query_id":"%d","text":"⏳\nПожалуйста, дождитесь завершения обработки предыдущего запроса","show_alert":true}`
-	answerCallbackOkTemplate     = `{"callback_query_id":"%d"}`
-	answerCallbackAlertTemplate  = `{"callback_query_id":"%d","text":"%s","show_alert":true}`
-
-	cantMove      = "😿\nCan't move"
-	cantMoveUp    = cantMove + " up"
-	cantMoveDown  = cantMove + " down"
-	cantMoveLeft  = cantMove + " left"
-	cantMoveRight = cantMove + " right"
-	cantSleep     = "😿\nThere's no time for sleep now"
-	cantDoIt      = "😿\nCan't do it now"
+	answerCallbackOkTemplate    = `{"callback_query_id":"%d"}`
+	answerCallbackAlertTemplate = `{"callback_query_id":"%d","text":"%s","show_alert":true}`
 )
 
 type GameServer struct {
 	databaseMutex         sync.Mutex
 	userCacheMutex        sync.RWMutex
 	userCache             map[int64]*User
+	sleepingUsersMutex    sync.RWMutex
+	sleepingUsers         map[int64]chan struct{}
 	apiUrl                string
 	gameBoofer            *GameBoofer
 	lastCleaningDaemonRun time.Time
@@ -213,6 +206,9 @@ type User struct {
 	thisFrameId  string
 	prevFrameId  string
 	watchingBack bool
+	lang         string
+	action       string
+	botAction    string
 }
 
 type GameBoofer struct {
@@ -259,6 +255,7 @@ func (gs *GameServer) startCleaningDaemon() {
 	go func() {
 		for {
 			gs.userCacheMutex.Lock()
+			gs.sleepingUsersMutex.Lock()
 			for id, user := range gs.userCache {
 				if time.Since(user.lastActivity).Minutes() > 59 {
 					select {
@@ -266,14 +263,17 @@ func (gs *GameServer) startCleaningDaemon() {
 					default:
 						continue
 					}
-					// TODO SAVE TO DATABASE
+					gs.addSleeper(id, user.ToSerial())
+					gs.sleepingUsers[id] = user.token
 					user.game.ResetGame()
 					gs.gameBoofer.returnGame(user.game)
 					delete(gs.userCache, id)
+					<-user.token
 				}
 			}
 			gs.lastCleaningDaemonRun = time.Now()
 			gs.userCacheMutex.Unlock()
+			gs.sleepingUsersMutex.Unlock()
 			time.Sleep(60 * time.Minute)
 		}
 	}()
@@ -318,15 +318,19 @@ func main() {
 	}
 
 	server := &GameServer{
-		userCache:  make(map[int64]*User),
-		apiUrl:     addr + path,
-		gameBoofer: newGameBoofer(),
-		price:      price,
+		userCache:     make(map[int64]*User),
+		apiUrl:        addr + path,
+		gameBoofer:    newGameBoofer(),
+		price:         price,
+		sleepingUsers: make(map[int64]chan struct{}),
 	}
 	server.startCleaningDaemon()
 	server.startGRPCMetricsServerDaemon(9890)
 	server.initDatabase()
 	server.leaderboardNames, server.leaderboardScores = server.loadLeaderboard()
+	for _, id := range server.getSleepingIdList() {
+		server.sleepingUsers[id] = make(chan struct{}, 1)
+	}
 
 	http.Handle("/", server)
 	http.Handle("/"+sysEP+"/", newSysController(sysToken, server))
@@ -345,7 +349,7 @@ func (gs *GameServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gs *GameServer) handleRequest(body []byte) {
-	log.Println("request:", string(body)) // TODO DELETE
+	//log.Println("request:", string(body)) // TODO DELETE
 
 	userId, err := getUserId(body)
 	if err != nil {
@@ -356,46 +360,77 @@ func (gs *GameServer) handleRequest(body []byte) {
 	user, ok := gs.userCache[userId]
 	gs.userCacheMutex.RUnlock()
 	if !ok {
-		chId, err := getChatId(body)
-		if err != nil {
-			// Maybe payment
-			preCheckoutQueryId := getPreCheckoutQueryId(body)
-			if preCheckoutQueryId == "" {
+		gs.sleepingUsersMutex.RLock()
+		sleepingUserToken, ok := gs.sleepingUsers[userId]
+		gs.sleepingUsersMutex.RUnlock()
+
+		if !ok {
+			chId, err := getChatId(body)
+			if err != nil {
+				// Maybe payment
+				preCheckoutQueryId := getPreCheckoutQueryId(body)
+				if preCheckoutQueryId == "" {
+					return
+				}
+				text, ok := answerStartForBuy[user.lang]
+				if !ok {
+					text = answerStartForBuy[defaultLang]
+				}
+				gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, text)
 				return
 			}
-			gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Для совершения покупок необходимо начать игру.`)
+			if bytes.Contains(body, startText) { // == command "New game"
+				user = new(User)
+				user.token = make(chan struct{}, 1)
+				user.token <- struct{}{}
+
+				gs.userCacheMutex.Lock()
+				gs.userCache[userId] = user
+				gs.userCacheMutex.Unlock()
+
+				user.id = userId
+				user.chatId = chId
+				user.messageId = -1
+				user.name = getName(body)
+				user.game = gs.gameBoofer.getGame()
+				user.lang = getLang(body)
+				user.game.HasHair, user.gotHair = gs.loadUserUsingHair(userId)
+				user.lastActivity = time.Now()
+
+				user.game.RefreshFrame()
+				gs.sendNewGameMessage(user)
+				<-user.token
+			}
+			incomingMessageId, err := getMessageId(body)
+			if err != nil {
+				return
+			}
+			gs.sendDeleteMessage(chId, incomingMessageId)
 			return
 		}
-		if bytes.Contains(body, startText) { // == command "New game"
-			user = new(User)
-			user.token = make(chan struct{}, 1)
-			user.token <- struct{}{}
 
-			gs.userCacheMutex.Lock()
-			gs.userCache[userId] = user
-			gs.userCacheMutex.Unlock()
-
-			user.id = userId
-			user.chatId = chId
-			user.messageId = -1
-			user.name = getName(body)
-			user.game = gs.gameBoofer.getGame()
-			user.game.HasHair, user.gotHair = gs.loadUserUsingHair(userId)
-			user.lastActivity = time.Now()
-
-			user.game.RefreshFrame()
-			gs.sendNewGameMessage(user)
-			<-user.token
-		} else if bytes.Contains(body, wakeUpText) {
-			// TODO DB
+		select {
+		case sleepingUserToken <- struct{}{}:
+		default:
 			return
 		}
-		incomingMessageId, err := getMessageId(body)
-		if err != nil {
+		data, ok := gs.getSleeperData(userId)
+		if !ok {
+			<-sleepingUserToken
 			return
 		}
-		gs.sendDeleteMessage(chId, incomingMessageId)
-		return
+		user = new(User)
+		user.RestoreFrom(data, gs.gameBoofer.getGame())
+		user.token = sleepingUserToken
+		user.lastActivity = time.Now()
+		gs.deleteSleeper(userId)
+		gs.userCacheMutex.Lock()
+		gs.userCache[userId] = user
+		gs.userCacheMutex.Unlock()
+		gs.sleepingUsersMutex.Lock()
+		delete(gs.sleepingUsers, userId)
+		gs.sleepingUsersMutex.Unlock()
+		<-sleepingUserToken
 	}
 
 	callbackId, err := getCallbackId(body)
@@ -408,10 +443,14 @@ func (gs *GameServer) handleRequest(body []byte) {
 			if preCheckoutQueryId == "" {
 				return
 			}
-			gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Пожалуйста, дождитесь завершения обработки предыдущего запроса`)
+			text, ok := answerCallbackIsBusyText[user.lang]
+			if !ok {
+				text = answerCallbackIsBusyText[defaultLang]
+			}
+			gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, text)
 			return
 		}
-		gs.answerCallbackIsBusy(callbackId)
+		gs.answerCallbackIsBusy(callbackId, user.lang)
 		return
 	}
 
@@ -438,32 +477,49 @@ func (gs *GameServer) handleRequest(body []byte) {
 			}
 		} else {
 			if user.gotHair {
-				gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Покупка уже выполнена`)
+				text, ok := answerBoughtAlready[user.lang]
+				if !ok {
+					text = answerBoughtAlready[defaultLang]
+				}
+				gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, text)
 			} else {
 				if ok := gs.updatePaymentsDatabase(user.id, true); ok {
 					user.gotHair = true
 					user.game.HasHair = true
 					user.game.RefreshFrame()
+					user.action, ok = actionHaircut[user.lang]
+					if !ok {
+						user.action = actionHaircut[defaultLang]
+					}
 					gs.sendActualFrame(user, true)
 					gs.answerOkPreCheckoutQuery(preCheckoutQueryId)
 				} else {
-					gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, `Покупка сейчас недоступна, пожалуйста, повторите попытку позднее`)
+					text, ok := answerBoughtIsNotAvailable[user.lang]
+					if !ok {
+						text = answerBoughtIsNotAvailable[defaultLang]
+					}
+					gs.sendErrorPreCheckoutQueryAnswer(preCheckoutQueryId, text)
 				}
 			}
 		}
 	} else {
 		// This is callback
+		user.lastActivity = time.Now()
 		gs.handleCallback(user, body, callbackId)
 	}
 
 	<-user.token
 }
 
-func (gs *GameServer) answerCallbackIsBusy(callbackId int64) {
+func (gs *GameServer) answerCallbackIsBusy(callbackId int64, lang string) {
+	text, ok := answerCallbackIsBusyText[lang]
+	if !ok {
+		text = answerCallbackIsBusyText[defaultLang]
+	}
 	resp, _ := http.Post(
 		gs.apiUrl+methodAnswerCallbackQuery,
 		typeJSON,
-		strings.NewReader(fmt.Sprintf(answerCallbackIsBusyTemplate, callbackId)),
+		strings.NewReader(fmt.Sprintf(answerCallbackAlertTemplate, callbackId, text)),
 	)
 	if resp != nil {
 		resp.Body.Close()
@@ -476,6 +532,7 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 		return
 	}
 	var alertMessage string
+	var ok bool
 	switch callbackData {
 	case callback0: // Close message
 		gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
@@ -486,13 +543,23 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 		return
 	case callback1:
 		if user.gotHair {
+			if gs.deleteUnknownMessage(user, body, callbackId) {
+				return
+			}
 			if user.watchingBack {
-				alertMessage = cantDoIt
+				alertMessage, ok = answerCantDoIt[user.lang]
+				if !ok {
+					alertMessage = answerCantDoIt[defaultLang]
+				}
 			} else {
 				gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
 				user.game.HasHair = !user.game.HasHair
 				gs.updatePaymentsDatabase(user.id, user.game.HasHair)
 				user.game.RefreshFrame()
+				user.action, ok = actionHaircut[user.lang]
+				if !ok {
+					user.action = actionHaircut[defaultLang]
+				}
 				gs.sendActualFrame(user, true)
 				return
 			}
@@ -502,44 +569,119 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 			return
 		}
 	case callback2:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.watchingBack || !user.game.MovePlayerTo(game.North) {
-			alertMessage = cantMoveUp
+			alertMessage, ok = answerCantMoveUp[user.lang]
+			if !ok {
+				alertMessage = answerCantMoveUp[defaultLang]
+			}
+		} else {
+			user.action, ok = actionPathRed[user.lang]
+			if !ok {
+				user.action = actionPathRed[defaultLang]
+			}
 		}
 	case callback3:
 		if gs.leaderboardScores[0] == 0 {
-			alertMessage = "No results yet"
+			alertMessage, ok = answerNoResults[user.lang]
+			if !ok {
+				alertMessage = answerNoResults[defaultLang]
+			}
 		} else {
 			gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
 			gs.sendLeaderboard(user)
 			return
 		}
 	case callback4:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.watchingBack || !user.game.MovePlayerTo(game.West) {
-			alertMessage = cantMoveLeft
+			alertMessage, ok = answerСantMoveLeft[user.lang]
+			if !ok {
+				alertMessage = answerСantMoveLeft[defaultLang]
+			}
+		} else {
+			user.action, ok = actionPathYellow[user.lang]
+			if !ok {
+				user.action = actionPathYellow[defaultLang]
+			}
 		}
 	case callback5:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.watchingBack || !user.game.MovePlayerTo(game.NoDirection) {
-			alertMessage = cantSleep
+			alertMessage, ok = answerCantSleep[user.lang]
+			if !ok {
+				alertMessage = answerCantSleep[defaultLang]
+			}
+		} else {
+			user.action, ok = actionSleep[user.lang]
+			if !ok {
+				user.action = actionSleep[defaultLang]
+			}
 		}
 	case callback6:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.watchingBack || !user.game.MovePlayerTo(game.East) {
-			alertMessage = cantMoveRight
+			alertMessage, ok = answerCantMoveRight[user.lang]
+			if !ok {
+				alertMessage = answerCantMoveRight[defaultLang]
+			}
+		} else {
+			user.action, ok = actionPathGreen[user.lang]
+			if !ok {
+				user.action = actionPathGreen[defaultLang]
+			}
 		}
 	case callback7:
 		gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
 		gs.sendHelp(user)
 		return
 	case callback8:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.watchingBack || !user.game.MovePlayerTo(game.South) {
-			alertMessage = cantMoveDown
+			alertMessage, ok = answerСantMoveDown[user.lang]
+			if !ok {
+				alertMessage = answerСantMoveDown[defaultLang]
+			}
+		} else {
+			user.action, ok = actionPathBlue[user.lang]
+			if !ok {
+				user.action = actionPathBlue[defaultLang]
+			}
 		}
 	case callback9:
+		if gs.deleteUnknownMessage(user, body, callbackId) {
+			return
+		}
 		if user.prevFrameId == "" {
-			alertMessage = cantDoIt
+			alertMessage, ok = answerCantDoIt[user.lang]
+			if !ok {
+				alertMessage = answerCantDoIt[defaultLang]
+			}
 		} else {
 			gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
 			user.watchingBack = !user.watchingBack
 			if user.watchingBack {
+				if user.game.PlayerIsAlive() {
+					user.action, ok = actionWatchBackAlive[user.lang]
+					if !ok {
+						user.action = actionWatchBackAlive[defaultLang]
+					}
+				} else {
+					user.action, ok = actionWatchBackDead[user.lang]
+					if !ok {
+						user.action = actionWatchBackDead[defaultLang]
+					}
+				}
 				gs.sendPrevFrameById(user)
 			} else {
 				gs.sendThisFrameById(user)
@@ -547,6 +689,7 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 			return
 		}
 	default:
+		gs.deleteUnknownMessage(user, body, callbackId)
 		return
 	}
 
@@ -561,6 +704,10 @@ func (gs *GameServer) handleCallback(user *User, body []byte, callbackId int64) 
 				defer wg.Done()
 				user.game.MoveEnemies()
 				user.game.RefreshFrame()
+				user.botAction, ok = actionBot[user.lang]
+				if !ok {
+					user.botAction = actionBot[defaultLang]
+				}
 			}()
 			go func() {
 				defer wg.Done()
@@ -594,11 +741,20 @@ func (gs *GameServer) sendActualFrame(user *User, hairOnly bool) {
 	png.Encode(&frameBuffer, user.game.Frame)
 
 	var caption strings.Builder
+	caption.WriteString(user.action)
 	for _, event := range user.game.TurnEvents {
 		if event != game.EventEmpty {
-			caption.WriteString(localizationEvents["ru"][event])
+			lib, ok := localizationEvents[user.lang]
+			if !ok {
+				lib = localizationEvents[defaultLang]
+			}
+			caption.WriteString(lib[event])
 		}
 	}
+	caption.WriteString(user.botAction)
+	defer func() { user.action = "" }()
+	defer func() { user.botAction = "" }()
+
 	dataToSend := map[string]io.Reader{
 		"media":        strings.NewReader(`{"type":"photo","media":"attach://gameframe","caption":"` + caption.String() + `","show_caption_above_media":true}`),
 		"chat_id":      strings.NewReader(strconv.FormatInt(user.chatId, 10)),
@@ -646,10 +802,25 @@ func (gs *GameServer) sendActualFrame(user *User, hairOnly bool) {
 }
 
 func (gs *GameServer) sendThisFrameById(user *User) {
+	var caption strings.Builder
+	caption.WriteString(user.action)
+	for _, event := range user.game.TurnEvents {
+		if event != game.EventEmpty {
+			lib, ok := localizationEvents[user.lang]
+			if !ok {
+				lib = localizationEvents[defaultLang]
+			}
+			caption.WriteString(lib[event])
+		}
+	}
+	caption.WriteString(user.botAction)
+	defer func() { user.action = "" }()
+	defer func() { user.botAction = "" }()
+
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
 		"message_id":` + fmt.Sprint(user.messageId) + `,
-		"media":{"type":"photo","media":"` + user.thisFrameId + `","caption":"` + "Просмотр актуального кадра состояния игры." + `","show_caption_above_media":true},
+		"media":{"type":"photo","media":"` + user.thisFrameId + `","caption":"` + caption.String() + `","show_caption_above_media":true},
 		"reply_markup":` + gs.getKeyboard(user) + `
 	}`
 
@@ -660,18 +831,10 @@ func (gs *GameServer) sendThisFrameById(user *User) {
 }
 
 func (gs *GameServer) sendPrevFrameById(user *User) {
-	var caption string
-
-	if user.game.PlayerIsAlive() {
-		caption = "Просмотр кадра состояния игры до вражеского хода.\nДля продолжения вернитесь к актуальному кадру."
-	} else {
-		caption = "Просмотр кадра состояния игры до вражеского хода."
-	}
-
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
 		"message_id":` + fmt.Sprint(user.messageId) + `,
-		"media":{"type":"photo","media":"` + user.prevFrameId + `","caption":"` + caption + `","show_caption_above_media":true},
+		"media":{"type":"photo","media":"` + user.prevFrameId + `","caption":"` + user.action + `","show_caption_above_media":true},
 		"reply_markup":` + gs.getKeyboard(user) + `
 	}`
 
@@ -679,6 +842,8 @@ func (gs *GameServer) sendPrevFrameById(user *User) {
 	if resp != nil {
 		resp.Body.Close()
 	}
+
+	user.action = ""
 }
 
 func (gs *GameServer) sendNewGameMessage(user *User) {
@@ -688,7 +853,11 @@ func (gs *GameServer) sendNewGameMessage(user *User) {
 	var caption strings.Builder
 	for _, event := range user.game.TurnEvents {
 		if event != game.EventEmpty {
-			caption.WriteString(localizationEvents["ru"][event])
+			lib, ok := localizationEvents[user.lang]
+			if !ok {
+				lib = localizationEvents[defaultLang]
+			}
+			caption.WriteString(lib[event])
 		}
 	}
 	dataToSend := map[string]io.Reader{
@@ -757,7 +926,11 @@ func (gs *GameServer) sendDeleteMessage(chatId, messageId int64) {
 
 func (gs *GameServer) sendLeaderboard(user *User) {
 	var builder strings.Builder
-	builder.WriteString("Лучшие игроки в Catch!\n\n")
+	head, ok := leaderboardHead[user.lang]
+	if !ok {
+		head = leaderboardHead[defaultLang]
+	}
+	builder.WriteString(head)
 	gs.leaderboardMutex.RLock()
 	builder.WriteString(fmt.Sprintf(leaderboardMessageTemplate0, gs.leaderboardNames[0], gs.leaderboardScores[0]))
 	if gs.leaderboardScores[1] != 0 {
@@ -789,13 +962,24 @@ func (gs *GameServer) sendLeaderboard(user *User) {
 }
 
 func (gs *GameServer) sendHelp(user *User) {
-	var text = `*Об игре*
-Правила игры: [telegra\\.ph/Catch](https://telegra.ph/Catch-Pravila-igry-08-18)
-Автор: [WRABZY](https://t.me/WRABZY)`
+	head, ok := helpHead[user.lang]
+	if !ok {
+		head = helpHead[defaultLang]
+	}
+
+	help, ok := helpLink[user.lang]
+	if !ok {
+		help = helpLink[defaultLang]
+	}
+
+	author, ok := authorLink[user.lang]
+	if !ok {
+		author = authorLink[defaultLang]
+	}
 
 	dataToSend := `{
 		"chat_id":` + fmt.Sprint(user.chatId) + `,
-		"text":"` + text + `",
+		"text":"` + head + help + author + `",
 		"parse_mode":"MarkdownV2",
 		"reply_markup":` + inlineKeyboardClose + `,
 		"link_preview_options": {"url": "https://telegra.ph/Catch-Pravila-igry-08-18"}
@@ -805,14 +989,18 @@ func (gs *GameServer) sendHelp(user *User) {
 	if err != nil {
 		return
 	}
-	bbb, _ := io.ReadAll(resp.Body)
-	log.Println(string(bbb))
 	resp.Body.Close()
 }
 
 func (gs *GameServer) sendShop(user *User) {
-	var title = `Лавандовое каре`
-	var description = `Вы можете поддержать разработчика, купив для главной фигуры игры альтернативный образ`
+	title, ok := haircutName[user.lang]
+	if !ok {
+		title = haircutName[defaultLang]
+	}
+	description, ok := shopDescription[user.lang]
+	if !ok {
+		description = shopDescription[defaultLang]
+	}
 	var inlineKeyboardPay = fmt.Sprintf(inlineKeyboardPayTemplate, gs.price)
 	var prices = fmt.Sprintf(`[{"label":"stars","amount":%d}]`, gs.price)
 
@@ -933,4 +1121,18 @@ func (gs *GameServer) getKeyboard(user *User) string {
 		}
 	}
 	return inlineKeyboardWait
+}
+
+func (gs *GameServer) deleteUnknownMessage(user *User, body []byte, callbackId int64) bool {
+	messageId, err := getMessageId(body)
+	if err != nil {
+		return false
+
+	}
+	if messageId != user.messageId {
+		gs.answerCallback(fmt.Sprintf(answerCallbackOkTemplate, callbackId))
+		gs.sendDeleteMessage(user.chatId, messageId)
+		return true
+	}
+	return false
 }

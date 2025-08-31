@@ -1,0 +1,5 @@
+addr=<bot_addr>
+path=<bot_token>
+sys_endpoint=<admin_path>
+sys_token=<admin_token>
+price=<price>

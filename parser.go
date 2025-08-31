@@ -49,3 +49,11 @@ func getCallbackData(body []byte) (byte, error) {
 func getFileId(body []byte) string {
 	// not public
 }
+
+func getPreCheckoutQueryId(body []byte) string {
+	// not public
+}
+
+func getLang(body []byte) string {
+	// not public
+}
